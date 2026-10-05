@@ -181,12 +181,8 @@
   <header class="top">
     <div class="bar">
       <button id="connect" data-t="connect" data-ic="port_usb_c"></button>
-      <button id="cap" data-t="capStart"></button>
-      <button id="capdl" data-t="capDownload" disabled></button>
-      <button id="capclear" data-t="capClear" disabled></button>
       <span id="version" class="dim"></span>
       <span id="live" class="dim"></span>
-      <span id="capstat" class="dim"></span>
       <span id="mock" class="dim" hidden data-t="mock"></span>
     </div>
     <div id="status"></div>
@@ -1842,7 +1838,6 @@ function setLabel(e, txt) { e.replaceChildren(...(e.dataset.ic ? [icon(e.dataset
 const TEXT = {
   ja: {
     other: "English", connect: "接続", disconnect: "切断", mock: "モック（実機なし）",
-    capStart: "キャプチャ開始", capStop: "キャプチャ停止", capDownload: "キャプチャ保存", capClear: "キャプチャ消去",
     sound: "音色", engine: "エンジン", presets: "プリセット", initSound: "音色を初期化",
     track: "トラック", drum: "ドラム",
     saveFile: "ファイルに保存", loadFile: "ファイルを読み込む", projects: "プロジェクト",
@@ -1914,7 +1909,6 @@ const TEXT = {
   },
   en: {
     other: "日本語", connect: "Connect", disconnect: "Disconnect", mock: "Mock device (no hardware)",
-    capStart: "Start capture", capStop: "Stop capture", capDownload: "Save capture", capClear: "Clear capture",
     sound: "Sound", engine: "Engine", presets: "Presets", initSound: "Init sound",
     track: "Track", drum: "Drums",
     saveFile: "Save to file", loadFile: "Load file", projects: "Projects",
@@ -1994,7 +1988,6 @@ function applyLang() {
   document.querySelectorAll("[data-t]").forEach((e) => setLabel(e, t(e.dataset.t)));
   $("lang").textContent = t("other");
   setLabel($("connect"), t(dev ? "disconnect" : "connect"));
-  if ($("cap")) capUpdateUI();
   if (lastKey) $("status").textContent = t(lastKey) + lastArg;
   $("libq").placeholder = t("libSearch");
   renderLive();
@@ -2074,8 +2067,6 @@ let dev = null;        /* {link, input, output, info, pdesc[], gdesc[], names[][
 let busy = 0;          /* multi-request operations in progress: no polling */
 let dragging = null;   /* key of the slider being dragged */
 let wantConnected = false;
-const cap = { on: false, started: 0, events: [] };  /* MIDI capture: events = {t, dir, b[]} */
-const CAP_MAX = 5000;
 const ctl = new Map(); /* key "s:id" -> {input, out, desc, scope, id, row} */
 const sets = new Map(); /* key -> {last: time of the user's last change, sent: the value last requested} */
 let needReload = false; /* a RELOAD push came: re-read DESC, DUMP and steps when free */
@@ -2121,56 +2112,6 @@ const isDrum = () => !!dev && !!dev.dump && dev.dump.engine >= dev.info.nengines
 const drumGrid = () => isDrum() && !!dev.info.proto && dev.info.proto >= 5;
 
 /* -------------------------------------------------------------- MIDI --- */
-let capUiTm = null;
-function capUpdateUI() {
-  const n = cap.events.length;
-  $("capdl").disabled = !n;
-  $("capclear").disabled = !n;
-  setLabel($("cap"), t(cap.on ? "capStop" : "capStart"));
-  $("capstat").textContent = n ? `${n}` : "";
-}
-function capMarkUI() {
-  if (capUiTm) return;
-  capUiTm = setTimeout(() => { capUiTm = null; capUpdateUI(); }, 100);
-}
-function capStart() {
-  cap.on = true;
-  cap.started = Date.now();
-  capUpdateUI();
-}
-function capStop() {
-  cap.on = false;
-  capUpdateUI();
-}
-function capClear() {
-  cap.events.length = 0;
-  capUpdateUI();
-}
-function capAdd(dir, bytesLike) {
-  if (!cap.on) return;
-  const tms = Date.now() - (cap.started || Date.now());
-  const b = Array.from(bytesLike);
-  cap.events.push({ t: tms, dir, b });
-  if (cap.events.length > CAP_MAX) cap.events.splice(0, cap.events.length - CAP_MAX);
-  capMarkUI();
-}
-function downloadBlob(name, blob) {
-  const a = el("a", { href: URL.createObjectURL(blob), download: name });
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-}
-function capDownload() {
-  const obj = {
-    format: "sloop-midi-capture",
-    version: 1,
-    startedAt: cap.started ? new Date(cap.started).toISOString() : null,
-    deviceName: dev?.input?.name || "",
-    events: cap.events.map((e) => ({ t: e.t, dir: e.dir, bytes: e.b })),
-  };
-  downloadBlob(`sloop-midi-capture-${today()}.json`, new Blob([JSON.stringify(obj, null, 1)], { type: "application/json" }));
-}
 async function connect() {
   wantConnected = true;
   if (!MOCK && !navigator.requestMIDIAccess) { sayK("nomidi"); return; }
@@ -2189,15 +2130,14 @@ async function connect() {
     const input = [...access.inputs.values()].find(isF);
     const output = [...access.outputs.values()].find(isF);
     if (!input || !output) { sayK("nodevice"); return; }
-    const send = (d) => { capAdd("out", d); output.send(d); };
-    const link = new Link(send, {
+    const link = new Link((d) => output.send(d), {
       timeout: 300,
       onUnknown: (f) => console.debug("ignored reply", f),
       onTimeout: () => sayK("noreply"),
       onPush: (f) => onPush(f),
       onGap: () => { rewatch = true; },
     });
-    input.onmidimessage = (e) => { capAdd("in", e.data); link.receive(e.data); };
+    input.onmidimessage = (e) => link.receive(e.data);
     if (input.open) await input.open().catch(() => {});
     dev = { link, input, output, info: null, pdesc: [], gdesc: [], names: [], dump: null, steps: [], slotUsed: [null, null, null, null],
       keys: null, watch: false, bank: null };
@@ -4092,9 +4032,6 @@ $("bkexport").addEventListener("click", () => libOp(async () => {
 $("connect").addEventListener("click", () => {
   if (dev) { wantConnected = false; disconnect(); } else connect();
 });
-$("cap").addEventListener("click", () => (cap.on ? capStop() : capStart()));
-$("capdl").addEventListener("click", () => capDownload());
-$("capclear").addEventListener("click", () => capClear());
 applyLang();
 showTab(tab);
 libInit();
